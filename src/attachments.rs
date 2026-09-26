@@ -5,10 +5,9 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek};
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_ATTACHMENT: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_ATTACHMENT: u64 = 1024 * 1024 * 1024;
 
 pub fn lock(challenge: &Path) -> Result<File> {
     reject_link(&challenge.join(".ctf"))?;
@@ -252,19 +251,7 @@ pub fn store(challenge: &Path, source: &str, name: &str, reader: impl Read) -> R
 }
 
 pub fn clipboard() -> Result<String> {
-    let candidates: &[(&str, &[&str])] = &[
-        ("wl-paste", &["--no-newline", "--type", "text"]),
-        ("xclip", &["-selection", "clipboard", "-out"]),
-        ("xsel", &["--clipboard", "--output"]),
-    ];
-    for (program, args) in candidates {
-        if let Ok(output) = Command::new(program).args(*args).output()
-            && output.status.success()
-        {
-            return String::from_utf8(output.stdout).context("clipboard text is not UTF-8");
-        }
-    }
-    bail!("could not read clipboard text; install wl-clipboard (Wayland), xclip, or xsel (X11)")
+    crate::clipboard::read()
 }
 
 #[cfg(test)]

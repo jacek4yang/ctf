@@ -1,5 +1,6 @@
 mod archive;
 mod attachments;
+mod clipboard;
 mod shell;
 mod workspace;
 
