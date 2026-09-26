@@ -60,6 +60,8 @@ pub fn complete(words: &[String]) -> Result<()> {
             "contest",
             "use",
             "new",
+            "rename",
+            "adopt",
             "list",
             "go",
             "import",
@@ -74,7 +76,7 @@ pub fn complete(words: &[String]) -> Result<()> {
             "--version",
         ])
     } else if words[0] == "contest" && words.len() == 2 {
-        Some(&["new", "list"])
+        Some(&["new", "list", "rename", "adopt"])
     } else if words[0] == "doctor" {
         Some(&["--fix", "--help"])
     } else if matches!(words[0].as_str(), "init" | "completions") {
@@ -95,8 +97,10 @@ pub fn complete(words: &[String]) -> Result<()> {
     }
     let contests = words.first().is_some_and(|s| s == "use")
         || (words.first().is_some_and(|s| s == "contest")
-            && words.get(1).is_some_and(|s| s == "list"));
-    let challenges = words.first().is_some_and(|s| s == "go" || s == "list");
+            && words.get(1).is_some_and(|s| s == "list" || s == "rename"));
+    let challenges = words
+        .first()
+        .is_some_and(|s| s == "go" || s == "list" || s == "rename");
     if !(contests || challenges) || !home()?.join(".ctf/index.json").is_file() {
         return Ok(());
     }

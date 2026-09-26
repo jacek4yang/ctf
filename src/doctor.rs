@@ -139,6 +139,7 @@ impl Audit {
             return Ok(());
         } // Never follow ambiguous or unsafe metadata references.
         self.report("OK", "workspace metadata", &index_path)?;
+        self.pending(&index)?;
         if index
             .current_contest
             .is_some_and(|id| !index.contests.iter().any(|c| c.entry.id == id))
@@ -215,8 +216,6 @@ impl Audit {
                     .starts_with(".tmp")
             {
                 self.disposable(&path, false, "abandoned metadata temporary file")?;
-            } else if path.file_name().unwrap_or_default() == "pending.json" {
-                self.report("ERROR", "interrupted lifecycle operation; inspect pending record before manual recovery", &path)?;
             }
         }
         Ok(())
@@ -232,6 +231,89 @@ impl Audit {
             File::open(path.parent().context("residue has no parent")?)?.sync_all()?;
         }
         self.report(if self.fix { "FIXED" } else { "FIXABLE" }, label, path)
+    }
+
+    fn pending(&mut self, index: &Index) -> Result<()> {
+        let path = self.root.join(".ctf/pending.json");
+        if fs::symlink_metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            return Ok(());
+        }
+        if !self.check(&path, false, "invalid pending operation")? {
+            return Ok(());
+        }
+        let pending: workspace::Pending = match serde_json::from_slice(&fs::read(&path)?) {
+            Ok(p) => p,
+            Err(_) => {
+                return self.report(
+                    "ERROR",
+                    "corrupt pending operation; inspect manually",
+                    &path,
+                );
+            }
+        };
+        if pending.id == 0
+            || workspace::validate_name(&pending.new).is_err()
+            || pending
+                .old
+                .as_ref()
+                .is_some_and(|s| workspace::validate_name(s).is_err())
+            || !matches!(pending.operation.as_str(), "rename" | "adopt")
+        {
+            return self.report(
+                "ERROR",
+                "invalid pending operation; inspect manually",
+                &path,
+            );
+        }
+        let (parent, entry) = if let Some(id) = pending.contest {
+            let Some(c) = index.contests.iter().find(|c| c.entry.id == id) else {
+                return self.report(
+                    "ERROR",
+                    "pending operation references unknown contest",
+                    &path,
+                );
+            };
+            (
+                self.root.join(&c.entry.name),
+                c.challenges.iter().find(|c| c.id == pending.id),
+            )
+        } else {
+            (
+                self.root.clone(),
+                index
+                    .contests
+                    .iter()
+                    .map(|c| &c.entry)
+                    .find(|c| c.id == pending.id),
+            )
+        };
+        if !self.check(&parent, true, "pending parent missing")? {
+            return Ok(());
+        }
+        let real_dir = |p: &Path| {
+            fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        };
+        let absent = |p: &Path| {
+            fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        };
+        let new = parent.join(&pending.new);
+        let completed = entry.is_some_and(|e| e.name == pending.new)
+            && real_dir(&new)
+            && real_dir(&new.join(".ctf"))
+            && pending.old.as_ref().is_none_or(|s| absent(&parent.join(s)));
+        let not_started = pending.operation == "rename"
+            && pending.old.as_ref().is_some_and(|old| {
+                entry.is_some_and(|e| e.name == *old) && real_dir(&parent.join(old)) && absent(&new)
+            });
+        let adopt_unapplied = pending.operation == "adopt"
+            && entry.is_none()
+            && real_dir(&new)
+            && absent(&new.join(".ctf"));
+        if completed || not_started || adopt_unapplied {
+            self.disposable(&path, false, "completed or unapplied lifecycle journal")
+        } else {
+            self.report("ERROR", &format!("interrupted {} #{} ({:?} -> {:?}); preserve both paths and restore metadata/path agreement before --fix", pending.operation, pending.id, pending.old, pending.new), &path)
+        }
     }
 
     fn challenge(&mut self, path: &Path) -> Result<()> {

@@ -44,6 +44,10 @@ ctf list --limit 50             # default: 20; also configurable with CTF_LIMIT
 ctf list --all
 ctf go 2                       # permanent ID, never a result row number
 ctf go 极客                     # exact name or unique fuzzy match
+ctf rename 2 "easy RSA"        # permanent ID stays 2
+ctf contest rename BUUCTF "BUU CTF"
+ctf adopt existing-directory   # direct child of the current contest
+ctf contest adopt existing-contest  # direct child of CTF_HOME
 
 ctf import ~/Downloads/challenge.zip
 ctf import 'https://example.org/attachment.zip'
@@ -87,8 +91,8 @@ to 1 GiB; archives to 10,000 entries. RAR, 7z, XZ, and encrypted archives are no
 supported. HTTP downloads have a 120-second timeout.
 
 Back up the entire workspace, including `.ctf` directories. IDs are never reused;
-manually deleting a challenge leaves its reserved record. Renaming/adopting
-existing directories is not supported. Originals are protected against accidental
+manually deleting a challenge leaves its reserved record. Adoption is explicit,
+never moves files, and rejects directories already containing `.ctf`. Originals are protected against accidental
 editing, not deliberate changes by their owner. Interrupted operations can leave
 an unregistered directory or unreferenced original. Use a local filesystem with
 reliable file locks and atomic rename.
@@ -100,6 +104,12 @@ reliable file locks and atomic rename.
 files and abandoned extraction staging, or clears an invalid current selection.
 It never adopts directories or reconstructs damaged IDs. Restore ambiguous
 metadata damage from a backup. Completed `extracted-*` directories are user data.
+Interrupted renames/adoptions leave `.ctf/pending.json` and block normal commands.
+Preserve the affected directories and inspect the record. For an uncommitted
+rename, move the new directory back to its recorded old name, then run
+`ctf doctor --fix`. Doctor clears only completed or unapplied journals; it never
+chooses between conflicting directories. Renaming your current directory refreshes
+Bash's path when integration is enabled.
 
 ## Development
 

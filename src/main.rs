@@ -29,6 +29,10 @@ enum Command {
     Use { query: Vec<String> },
     /// Create a challenge and enter its directory
     New { name: String },
+    /// Rename a challenge without changing its permanent ID (quote multiword queries)
+    Rename { query: String, new_name: String },
+    /// Adopt an existing direct child directory of the current contest
+    Adopt { directory: PathBuf },
     /// List challenges in the current contest
     List {
         query: Vec<String>,
@@ -70,6 +74,10 @@ enum Command {
 enum ContestCommand {
     /// Create a contest
     New { name: String },
+    /// Rename a contest without changing its permanent ID
+    Rename { query: String, new_name: String },
+    /// Adopt an existing direct child directory of the workspace
+    Adopt { directory: PathBuf },
     /// List contests by permanent ID
     List {
         query: Vec<String>,
@@ -104,6 +112,31 @@ fn run() -> Result<()> {
     }
     let mut ws = Workspace::open()?;
     match cli.command {
+        Command::Contest {
+            command: ContestCommand::Rename { query, new_name },
+        } => {
+            let id = resolve(&ws.contest_entries(), &[query])?.id;
+            let cwd = std::env::current_dir()?;
+            let (old, new) = ws.rename(None, id, &new_name)?;
+            renamed(&cwd, &old, &new, id, &new_name, "use")?;
+        }
+        Command::Rename { query, new_name } => {
+            let contest = ws.current_contest()?;
+            let id = resolve(&ws.challenge_entries(contest)?, &[query])?.id;
+            let cwd = std::env::current_dir()?;
+            let (old, new) = ws.rename(Some(contest), id, &new_name)?;
+            renamed(&cwd, &old, &new, id, &new_name, "go")?;
+        }
+        Command::Contest {
+            command: ContestCommand::Adopt { directory },
+        } => {
+            let entry = ws.adopt(None, &directory)?;
+            writeln!(io::stdout().lock(), "{}\t{}", entry.id, entry.name)?;
+        }
+        Command::Adopt { directory } => {
+            let entry = ws.adopt(Some(ws.current_contest()?), &directory)?;
+            writeln!(io::stdout().lock(), "{}\t{}", entry.id, entry.name)?;
+        }
         Command::Contest {
             command: ContestCommand::New { name },
         } => {
@@ -214,6 +247,27 @@ fn run() -> Result<()> {
         | Command::Completions { .. }
         | Command::Complete { .. } => {
             unreachable!()
+        }
+    }
+    Ok(())
+}
+
+fn renamed(
+    cwd: &std::path::Path,
+    old: &std::path::Path,
+    new: &std::path::Path,
+    id: u64,
+    name: &str,
+    command: &str,
+) -> Result<()> {
+    writeln!(io::stdout().lock(), "{id}\t{name}")?;
+    if let Ok(relative) = cwd.strip_prefix(old) {
+        if std::env::var_os("CTF_CD_FILE").is_some() {
+            shell::change_dir(&new.join(relative))?;
+        } else {
+            eprintln!(
+                "Current shell path changed; refresh it with `ctf {command} {id}` after enabling Bash integration"
+            );
         }
     }
     Ok(())
