@@ -2,6 +2,7 @@ use crate::workspace::validate_name;
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -127,7 +128,11 @@ impl Unpacker<'_> {
 /// Extract into an isolated new directory. Failure drops the whole staging tree;
 /// existing challenge files and metadata are never extraction destinations.
 pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
-    let file = File::open(input).with_context(|| format!("open archive {}", input.display()))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+        .open(input)
+        .with_context(|| format!("open archive {}", input.display()))?;
     ensure!(file.metadata()?.is_file(), "archive must be a regular file");
     ensure!(
         file.metadata()?.len() <= MAX_BYTES,
@@ -205,6 +210,7 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
         );
     }
     let count = unpacker.files;
+    sync_tree(stage.path())?;
     let output = challenge.join(
         stage
             .path()
@@ -221,6 +227,46 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
     File::open(challenge)?.sync_all()?;
     File::open(staging)?.sync_all()?;
     Ok((count, output))
+}
+
+fn sync_tree(root: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut directories = vec![root.to_path_buf()];
+    let mut cursor = 0;
+    let mut entries = 0;
+    let mut bytes = 0u64;
+    while cursor < directories.len() {
+        for entry in fs::read_dir(&directories[cursor])? {
+            let path = entry?.path();
+            let meta = fs::symlink_metadata(&path)?;
+            entries += 1;
+            ensure!(
+                entries <= MAX_ENTRIES,
+                "extracted tree exceeds {MAX_ENTRIES} entries including implicit directories"
+            );
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                directories.push(path);
+            } else {
+                ensure!(
+                    meta.is_file() && meta.nlink() == 1,
+                    "unsafe extracted link or special file"
+                );
+                bytes = bytes
+                    .checked_add(meta.len())
+                    .context("expanded size overflow")?;
+                ensure!(
+                    bytes <= MAX_BYTES,
+                    "archive exceeds 1 GiB expanded size limit"
+                );
+                crate::workspace::regular_file(&path)?.sync_all()?;
+            }
+        }
+        cursor += 1;
+    }
+    for path in directories.into_iter().rev() {
+        File::open(path)?.sync_all()?;
+    }
+    Ok(())
 }
 
 // 7z headers can allocate decoder dictionaries before exposing entries. Isolate

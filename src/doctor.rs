@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     collections::HashSet,
     fs::{self, File},
@@ -52,6 +53,9 @@ impl Audit {
         match fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 self.report("ERROR", "unsafe symlink", path)?
+            }
+            Ok(meta) if !directory && meta.nlink() != 1 => {
+                self.report("ERROR", "unsafe shared hardlink", path)?
             }
             Ok(meta)
                 if if directory {
@@ -101,7 +105,7 @@ impl Audit {
         if !self.check(&lock, false, "workspace lock missing")? {
             return Ok(());
         }
-        let _guard = File::open(&lock)?;
+        let _guard = workspace::regular_file(&lock)?;
         _guard.lock().context("lock workspace for inspection")?;
         let index_path = meta.join("index.json");
         if !self.check(
@@ -111,7 +115,8 @@ impl Audit {
         )? {
             return Ok(());
         }
-        let mut index: Index = match serde_json::from_slice(&fs::read(&index_path)?) {
+        let mut index: Index = match serde_json::from_slice(&workspace::read_regular(&index_path)?)
+        {
             Ok(index) => index,
             Err(_) => {
                 self.report(
@@ -241,23 +246,24 @@ impl Audit {
         if !self.check(&path, false, "invalid pending operation")? {
             return Ok(());
         }
-        let pending: workspace::Pending = match serde_json::from_slice(&fs::read(&path)?) {
-            Ok(p) => p,
-            Err(_) => {
-                return self.report(
-                    "ERROR",
-                    "corrupt pending operation; inspect manually",
-                    &path,
-                );
-            }
-        };
+        let pending: workspace::Pending =
+            match serde_json::from_slice(&workspace::read_regular(&path)?) {
+                Ok(p) => p,
+                Err(_) => {
+                    return self.report(
+                        "ERROR",
+                        "corrupt pending operation; inspect manually",
+                        &path,
+                    );
+                }
+            };
         if pending.id == 0
             || workspace::validate_name(&pending.new).is_err()
             || pending
                 .old
                 .as_ref()
                 .is_some_and(|s| workspace::validate_name(s).is_err())
-            || !matches!(pending.operation.as_str(), "rename" | "adopt")
+            || !matches!(pending.operation.as_str(), "rename" | "adopt" | "create")
         {
             return self.report(
                 "ERROR",
@@ -307,9 +313,9 @@ impl Audit {
             });
         let adopt_unapplied = pending.operation == "adopt"
             && entry.is_none()
-            && real_dir(&new)
-            && absent(&new.join(".ctf"));
-        if completed || not_started || adopt_unapplied {
+            && (absent(&new) || real_dir(&new) && absent(&new.join(".ctf")));
+        let create_unapplied = pending.operation == "create" && entry.is_none() && absent(&new);
+        if completed || not_started || adopt_unapplied || create_unapplied {
             self.disposable(&path, false, "completed or unapplied lifecycle journal")
         } else {
             self.report("ERROR", &format!("interrupted {} #{} ({:?} -> {:?}); preserve both paths and restore metadata/path agreement before --fix", pending.operation, pending.id, pending.old, pending.new), &path)
@@ -322,15 +328,13 @@ impl Audit {
             return Ok(());
         }
         let lock = meta.join("lock");
-        let _guard = if lock.try_exists()? {
+        let mut guard = if lock.try_exists()? {
             if !self.check(&lock, false, "invalid challenge lock")? {
                 return Ok(());
             }
-            let file = File::open(&lock)?;
+            let file = workspace::regular_file(&lock)?;
             file.lock()?;
             Some(file)
-        } else if self.fix {
-            Some(attachments::lock(path)?)
         } else {
             None
         };
@@ -349,6 +353,20 @@ impl Audit {
                 return Ok(());
             }
         };
+        if self.fix && guard.is_none() {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(&lock)?;
+            file.lock()?;
+            guard = Some(file);
+        }
+        let _guard = guard;
+        let before = self.problems;
+        let journal = meta.join("import.json");
+        let has_journal = fs::symlink_metadata(&journal).is_ok();
         self.internal(&meta)?;
         let archive = meta.join("archive");
         let archive_ok = if archive.try_exists()? || !data.attachments.is_empty() {
@@ -369,7 +387,7 @@ impl Audit {
             if !self.check(&original, false, "archived original missing")? {
                 continue;
             }
-            let mut file = File::open(&original)?;
+            let mut file = workspace::regular_file(&original)?;
             if file.metadata()?.len() != attachment.bytes {
                 self.report("ERROR", "recorded size mismatch", &original)?;
             }
@@ -386,7 +404,18 @@ impl Audit {
                 self.report("ERROR", "SHA-256 mismatch", &original)?;
             }
         }
-        if archive_ok {
+        if has_journal {
+            let committed = workspace::read_regular(&journal)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<attachments::Attachment>(&bytes).ok())
+                .is_some_and(|a| data.attachments.contains(&a));
+            if committed && before == self.problems {
+                self.disposable(&journal, false, "completed attachment import journal")?;
+            } else {
+                self.report("ERROR", "interrupted attachment import; preserve both copies and inspect import.json before manual recovery", &journal)?;
+            }
+        }
+        if archive_ok && !has_journal {
             for original in children(&archive)? {
                 if data
                     .attachments

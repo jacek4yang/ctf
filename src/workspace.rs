@@ -2,7 +2,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use unicode_normalization::UnicodeNormalization;
 
@@ -67,10 +68,20 @@ impl Workspace {
     }
 
     pub fn at(root: PathBuf) -> Result<Self> {
+        reject_link(&root)?;
         fs::create_dir_all(&root)
             .with_context(|| format!("create workspace {}", root.display()))?;
         let root = root.canonicalize()?;
         let meta = root.join(".ctf");
+        let existed = fs::symlink_metadata(&meta).is_ok();
+        if !existed {
+            for child in fs::read_dir(&root)? {
+                ensure!(
+                    !child?.path().join(".ctf").try_exists()?,
+                    "workspace index missing but managed directories remain; restore .ctf from backup, then run `ctf doctor`"
+                );
+            }
+        }
         directory(&meta)?;
         let lock_path = meta.join("lock");
         reject_link(&lock_path)?;
@@ -79,7 +90,14 @@ impl Workspace {
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
             .open(lock_path)?;
+        ensure!(
+            lock.metadata()?.is_file() && lock.metadata()?.nlink() == 1,
+            "unsafe workspace lock"
+        );
         lock.lock().context("lock workspace")?;
         ensure!(
             fs::symlink_metadata(meta.join("pending.json"))
@@ -88,12 +106,12 @@ impl Workspace {
         );
         let index_path = meta.join("index.json");
         reject_link(&index_path)?;
-        let index = match fs::read(&index_path) {
+        let index = match read_regular(&index_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).context("invalid workspace metadata (index.json); restore a backup rather than resetting IDs")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Index {
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) && !existed => Index {
                 version: 1, next_contest: 1, current_contest: None, contests: Vec::new(),
             },
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error).context("cannot read workspace index; restore a backup and run `ctf doctor` (IDs will not be reset)"),
         };
         let ws = Self {
             root,
@@ -103,6 +121,10 @@ impl Workspace {
         ws.validate()?;
         if !index_path.exists() {
             ws.save()?;
+            File::open(&ws.root)?.sync_all()?;
+            if let Some(parent) = ws.root.parent() {
+                File::open(parent)?.sync_all()?;
+            }
         }
         Ok(ws)
     }
@@ -181,13 +203,26 @@ impl Workspace {
         // Reserve IDs before filesystem changes: a failed creation may leave a gap, never a reused ID.
         self.save()?;
         let path = self.root.join(name);
-        fs::create_dir(&path).with_context(|| {
-            format!(
-                "create contest {} (existing directories are never adopted)",
-                path.display()
-            )
+        self.begin(&Pending {
+            operation: "create".into(),
+            contest: None,
+            id: entry.id,
+            old: None,
+            new: name.into(),
         })?;
+        if let Err(error) = fs::create_dir(&path) {
+            self.finish()?;
+            return Err(error).with_context(|| {
+                format!(
+                    "create contest {} (existing directories are never adopted)",
+                    path.display()
+                )
+            });
+        }
         directory(&path.join(".ctf"))?;
+        File::open(path.join(".ctf"))?.sync_all()?;
+        File::open(&path)?.sync_all()?;
+        File::open(&self.root)?.sync_all()?;
         self.index.contests.push(Contest {
             entry: entry.clone(),
             next_challenge: 1,
@@ -197,6 +232,7 @@ impl Workspace {
             self.index.current_contest = Some(entry.id);
         }
         self.save()?;
+        self.finish()?;
         Ok(entry)
     }
 
@@ -222,14 +258,26 @@ impl Workspace {
             .checked_add(1)
             .context("challenge ID space exhausted")?;
         self.save()?;
-        fs::create_dir(&path).with_context(|| {
-            format!(
-                "create challenge {} (existing directories are never adopted)",
-                path.display()
-            )
+        self.begin(&Pending {
+            operation: "create".into(),
+            contest: Some(contest),
+            id: entry.id,
+            old: None,
+            new: name.into(),
         })?;
+        if let Err(error) = fs::create_dir(&path) {
+            self.finish()?;
+            return Err(error).with_context(|| {
+                format!(
+                    "create challenge {} (existing directories are never adopted)",
+                    path.display()
+                )
+            });
+        }
         directory(&path.join(".ctf"))?;
         crate::attachments::save(&path, &crate::attachments::Metadata::default())?;
+        File::open(&path)?.sync_all()?;
+        File::open(path.parent().context("challenge parent missing")?)?.sync_all()?;
         self.index
             .contests
             .iter_mut()
@@ -238,6 +286,7 @@ impl Workspace {
             .challenges
             .push(entry.clone());
         self.save()?;
+        self.finish()?;
         Ok(entry)
     }
 
@@ -559,6 +608,27 @@ pub fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// Metadata is never allowed to be a symlink, device, FIFO, or shared hardlink.
+pub fn regular_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file() && meta.nlink() == 1,
+        "unsafe metadata/original file: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
+pub fn read_regular(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    regular_file(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn folded(value: &str) -> String {
     value.nfkc().flat_map(char::to_lowercase).collect()
 }
@@ -611,7 +681,10 @@ pub fn resolve<'a>(entries: &'a [Entry], query: &[String]) -> Result<&'a Entry> 
         !joined.trim().is_empty(),
         "provide an ID or a nonempty query"
     );
-    if let Ok(id) = joined.parse::<u64>() {
+    if joined.bytes().all(|b| b.is_ascii_digit()) {
+        let id = joined
+            .parse::<u64>()
+            .context("permanent ID is out of range; use an ID printed by list")?;
         return entries
             .iter()
             .find(|e| e.id == id)
