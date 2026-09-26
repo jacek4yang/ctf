@@ -5,7 +5,7 @@ are ordinary directories, with permanent numeric IDs and Unicode-friendly search
 
 ## Install
 
-Requires stable Rust (1.89+) and Bash.
+Requires stable Rust (1.93+) and Bash.
 
 ```bash
 cargo install --git https://github.com/jacek4yang/ctf --locked
@@ -83,12 +83,14 @@ UTF-8 text is saved byte-for-byte, including empty text and line endings. Legacy
 Clipboard transfers have a five-second deadline and the same 1 GiB attachment
 limit. Targets are stored as raw text. Neither command executes or decodes input.
 
-Extraction supports ZIP, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, GZIP, and BZIP2. It creates
+Extraction supports ZIP, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, TAR.XZ/TXZ, GZIP, BZIP2,
+XZ, and 7z (Copy, LZMA/LZMA2, BZIP2, Deflate). No archive helper is required. It creates
 a new `extracted-*` directory inside the challenge, rejecting traversal, absolute
 paths, links, special files, conflicting entries, and `.ctf` paths. It never
 recursively unpacks nested archives. Imports and expanded archives are limited
-to 1 GiB; archives to 10,000 entries. RAR, 7z, XZ, and encrypted archives are not
-supported. HTTP downloads have a 120-second timeout.
+to 1 GiB; archives to 10,000 entries. RAR and encrypted archives are not supported.
+XZ dictionaries are limited to 256 MiB. The isolated 7z decoder has a 1 GiB
+address-space limit and a 120-second deadline. HTTP downloads have a 120-second timeout.
 
 Back up the entire workspace, including `.ctf` directories. IDs are never reused;
 manually deleting a challenge leaves its reserved record. Adoption is explicit,

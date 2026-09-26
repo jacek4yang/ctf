@@ -10,7 +10,7 @@ const MAX_ENTRIES: usize = 10_000;
 fn supported(path: &Path) -> bool {
     let name = path.to_string_lossy().to_lowercase();
     [
-        ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".gz", ".bz2",
+        ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".gz", ".bz2", ".xz", ".txz", ".7z",
     ]
     .iter()
     .any(|ext| name.ends_with(ext))
@@ -32,9 +32,7 @@ pub fn select(challenge: &Path, input: Option<PathBuf>) -> Result<PathBuf> {
         .collect();
     match archives.as_slice() {
         [path] => Ok(path.clone()),
-        [] => bail!(
-            "no supported archive found; provide a .zip, .tar, .tar.gz, .tar.bz2, .gz, or .bz2 file"
-        ),
+        [] => bail!("no supported archive found; provide ZIP, TAR, GZIP, BZIP2, XZ, or 7z input"),
         _ => bail!("multiple archives found; specify one with `ctf extract FILE`"),
     }
 }
@@ -131,6 +129,10 @@ impl Unpacker<'_> {
 pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
     let file = File::open(input).with_context(|| format!("open archive {}", input.display()))?;
     ensure!(file.metadata()?.is_file(), "archive must be a regular file");
+    ensure!(
+        file.metadata()?.len() <= MAX_BYTES,
+        "archive input exceeds 1 GiB limit"
+    );
     // Only unfinished extraction lives in reserved metadata storage. Completed
     // extracted-* directories remain user data and are never doctor cleanup targets.
     crate::workspace::directory(&challenge.join(".ctf"))?;
@@ -173,6 +175,16 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
         unpacker.tar(flate2::read::MultiGzDecoder::new(file))?;
     } else if lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") {
         unpacker.tar(bzip2::read::MultiBzDecoder::new(file))?;
+    } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+        unpacker.tar(lzma_rust2::XzReader::new_mem_limit(file, true, 256 * 1024))?;
+    } else if lower.ends_with(".xz") {
+        unpacker.entry(
+            &name[..name.len() - 3],
+            false,
+            lzma_rust2::XzReader::new_mem_limit(file, true, 256 * 1024),
+        )?;
+    } else if lower.ends_with(".7z") {
+        unpacker.files = sevenz_process(input, stage.path())?;
     } else if lower.ends_with(".tar") {
         unpacker.tar(file)?;
     } else if lower.ends_with(".gz") {
@@ -188,7 +200,9 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
             bzip2::read::MultiBzDecoder::new(file),
         )?;
     } else {
-        bail!("unsupported archive format; supported: zip, tar, tar.gz/tgz, tar.bz2/tbz2, gz, bz2");
+        bail!(
+            "unsupported archive format; supported: zip, tar, tar.gz/tgz, tar.bz2/tbz2, tar.xz/txz, gz, bz2, xz, 7z"
+        );
     }
     let count = unpacker.files;
     let output = challenge.join(
@@ -209,10 +223,153 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
     Ok((count, output))
 }
 
+// 7z headers can allocate decoder dictionaries before exposing entries. Isolate
+// that parser in this same binary with OS limits; even an allocator abort cannot
+// bypass parent-owned staging cleanup. No shell or external archive executable.
+fn sevenz_process(input: &Path, stage: &Path) -> Result<usize> {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("__unpack7z")
+        .arg(input.canonicalize()?)
+        .arg(stage.canonicalize()?)
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("wait for 7z decoder");
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("7z decoding exceeded 120 seconds; staging removed");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    ensure!(
+        status.success(),
+        "7z decoding failed (corrupt/encrypted/unsupported input or resource limit); staging removed"
+    );
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .context("missing decoder result")?
+        .take(64)
+        .read_to_string(&mut output)?;
+    output.trim().parse().context("invalid internal 7z result")
+}
+
+pub fn unpack_7z(input: &Path, stage: &Path, parent: u32) -> Result<usize> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))?;
+    ensure!(
+        rustix::process::getppid().is_some_and(|pid| pid.as_raw_nonzero().get() as u32 == parent),
+        "7z parent exited before decoder startup"
+    );
+    for (resource, bound) in [
+        (Resource::As, 1024 * 1024 * 1024),
+        (Resource::Cpu, 120),
+        (Resource::Core, 0),
+    ] {
+        let old = getrlimit(resource);
+        setrlimit(
+            resource,
+            Rlimit {
+                current: Some(old.current.unwrap_or(bound).min(bound)),
+                maximum: old.maximum,
+            },
+        )?;
+    }
+    crate::workspace::reject_link(stage)?;
+    ensure!(
+        stage.is_dir() && fs::read_dir(stage)?.next().is_none(),
+        "7z requires empty isolated staging"
+    );
+    let mut archive =
+        sevenz_rust2::ArchiveReader::new(File::open(input)?, sevenz_rust2::Password::empty())
+            .context("read 7z header; encrypted archives are not supported")?;
+    archive.set_thread_count(1);
+    ensure!(
+        archive.archive().files.len() <= MAX_ENTRIES,
+        "archive exceeds {MAX_ENTRIES} entries"
+    );
+    let mut total = 0u64;
+    for entry in &archive.archive().files {
+        safe_path(&entry.name)?;
+        ensure!(!entry.is_anti_item, "7z anti-items are not supported");
+        if entry.has_windows_attributes {
+            let kind = (entry.windows_attributes >> 16) & 0o170000;
+            ensure!(
+                matches!(kind, 0 | 0o100000 | 0o040000) && entry.windows_attributes & 0x400 == 0,
+                "archive links and special files are not allowed"
+            );
+        }
+        total = total.checked_add(entry.size).context("7z size overflow")?;
+        ensure!(
+            total <= MAX_BYTES,
+            "archive exceeds 1 GiB expanded size limit"
+        );
+    }
+    for block in &archive.archive().blocks {
+        for coder in &block.coders {
+            ensure!(
+                coder.encoder_method_id() != [0x06, 0xf1, 0x07, 0x01],
+                "encrypted 7z archives are not supported"
+            );
+        }
+    }
+    let mut unpacker = Unpacker {
+        root: stage,
+        bytes: 0,
+        entries: 0,
+        files: 0,
+    };
+    archive.for_each_entries(|entry, reader| {
+        unpacker
+            .entry(&entry.name, entry.is_directory, reader)
+            .map_err(|error| sevenz_rust2::Error::Other(error.to_string().into()))?;
+        Ok(true)
+    })?;
+    Ok(unpacker.files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn expanded_size_and_entry_limits_are_enforced_before_commit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut unpacker = Unpacker {
+            root: temp.path(),
+            bytes: MAX_BYTES - 1,
+            entries: 0,
+            files: 0,
+        };
+        assert!(unpacker.entry("too-large", false, &b"xx"[..]).is_err());
+        let mut unpacker = Unpacker {
+            root: temp.path(),
+            bytes: 0,
+            entries: MAX_ENTRIES,
+            files: 0,
+        };
+        assert!(unpacker.entry("too-many", false, std::io::empty()).is_err());
+        assert!(!temp.path().join("too-many").exists());
+        Ok(())
+    }
     #[test]
     fn traversal_paths() {
         for name in [
