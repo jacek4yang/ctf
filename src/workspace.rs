@@ -30,6 +30,16 @@ pub(crate) struct Index {
     pub contests: Vec<Contest>,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Pending {
+    pub operation: String,
+    pub contest: Option<u64>,
+    pub id: u64,
+    pub old: Option<String>,
+    pub new: String,
+}
+
 pub struct Workspace {
     pub root: PathBuf,
     index: Index,
@@ -71,6 +81,11 @@ impl Workspace {
             .truncate(false)
             .open(lock_path)?;
         lock.lock().context("lock workspace")?;
+        ensure!(
+            fs::symlink_metadata(meta.join("pending.json"))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "interrupted lifecycle operation; run `ctf doctor` before making changes"
+        );
         let index_path = meta.join("index.json");
         reject_link(&index_path)?;
         let index = match fs::read(&index_path) {
@@ -230,6 +245,208 @@ impl Workspace {
         self.contest_path(id)?;
         self.index.current_contest = Some(id);
         self.save()
+    }
+
+    fn begin(&self, pending: &Pending) -> Result<()> {
+        atomic_json(&self.root.join(".ctf/pending.json"), pending)
+    }
+
+    fn finish(&self) -> Result<()> {
+        fs::remove_file(self.root.join(".ctf/pending.json"))?;
+        File::open(self.root.join(".ctf"))?.sync_all()?;
+        Ok(())
+    }
+
+    /// Rename within one parent. The journal remains on any ambiguous commit failure.
+    pub fn rename(
+        &mut self,
+        contest: Option<u64>,
+        id: u64,
+        name: &str,
+    ) -> Result<(PathBuf, PathBuf)> {
+        validate_name(name)?;
+        let entries = match contest {
+            Some(c) => self.challenge_entries(c)?,
+            None => self.contest_entries(),
+        };
+        let entry = entries
+            .iter()
+            .find(|e| e.id == id)
+            .context("ID not found")?;
+        ensure!(
+            !entries.iter().any(|e| e.name == name),
+            "destination name already registered: {name}"
+        );
+        let parent = match contest {
+            Some(c) => self.contest_path(c)?,
+            None => self.root.clone(),
+        };
+        let old = checked_directory(&parent.join(&entry.name))?;
+        let new = parent.join(name);
+        ensure!(
+            fs::symlink_metadata(&new).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "destination already exists or cannot be inspected"
+        );
+        checked_directory(&old.join(".ctf"))?;
+        let mut locks = Vec::new();
+        if contest.is_some() {
+            locks.push(crate::attachments::lock(&old)?);
+            crate::attachments::load(&old)?;
+        } else {
+            for c in self.challenge_entries(id)? {
+                let path = self.challenge_path(id, c.id)?;
+                locks.push(crate::attachments::lock(&path)?);
+                crate::attachments::load(&path)?;
+            }
+        }
+        self.begin(&Pending {
+            operation: "rename".into(),
+            contest,
+            id,
+            old: Some(entry.name.clone()),
+            new: name.into(),
+        })?;
+        if let Err(error) = rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &old,
+            rustix::fs::CWD,
+            &new,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            self.finish()?; // Failed syscall did not move the directory.
+            return Err(error).context("rename directory; destination was not replaced");
+        }
+        File::open(&parent)?.sync_all()?;
+        match contest {
+            Some(c) => {
+                self.index
+                    .contests
+                    .iter_mut()
+                    .find(|e| e.entry.id == c)
+                    .context("contest missing")?
+                    .challenges
+                    .iter_mut()
+                    .find(|e| e.id == id)
+                    .context("challenge missing")?
+                    .name = name.into()
+            }
+            None => {
+                self.index
+                    .contests
+                    .iter_mut()
+                    .find(|e| e.entry.id == id)
+                    .context("contest missing")?
+                    .entry
+                    .name = name.into()
+            }
+        }
+        self.save().context("directory renamed but metadata commit failed; run `ctf doctor` and inspect pending.json")?;
+        self.finish()?;
+        Ok((old, new))
+    }
+
+    pub fn adopt(&mut self, contest: Option<u64>, input: &Path) -> Result<Entry> {
+        let parent = match contest {
+            Some(c) => self.contest_path(c)?,
+            None => self.root.clone(),
+        };
+        ensure!(
+            !input
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "adoption path must not contain .."
+        );
+        let path = if input.components().count() == 1 && !input.is_absolute() {
+            parent.join(input)
+        } else if input.is_absolute() {
+            input.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(input)
+        };
+        // Check every existing component before canonicalization so aliases cannot hide symlinks.
+        let mut prefix = PathBuf::new();
+        for component in path.components() {
+            prefix.push(component);
+            reject_link(&prefix)?;
+        }
+        checked_directory(&path)?;
+        let path = path.canonicalize()?;
+        ensure!(
+            path.parent() == Some(parent.as_path()),
+            "adopt only a direct child of {}",
+            parent.display()
+        );
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("adoption name must be UTF-8")?;
+        validate_name(name)?;
+        ensure!(
+            fs::symlink_metadata(path.join(".ctf"))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "directory already contains .ctf; existing metadata is never overwritten or inferred"
+        );
+        let entries = match contest {
+            Some(c) => self.challenge_entries(c)?,
+            None => self.contest_entries(),
+        };
+        ensure!(
+            !entries.iter().any(|e| e.name == name),
+            "directory already registered"
+        );
+        let next = match contest {
+            Some(c) => {
+                &mut self
+                    .index
+                    .contests
+                    .iter_mut()
+                    .find(|e| e.entry.id == c)
+                    .context("contest missing")?
+                    .next_challenge
+            }
+            None => &mut self.index.next_contest,
+        };
+        let entry = Entry {
+            id: *next,
+            name: name.into(),
+        };
+        *next = next
+            .checked_add(1)
+            .context("permanent ID space exhausted")?;
+        self.save()?; // Reservations survive failed adoption; IDs are never reused.
+        self.begin(&Pending {
+            operation: "adopt".into(),
+            contest,
+            id: entry.id,
+            old: None,
+            new: name.into(),
+        })?;
+        fs::create_dir(path.join(".ctf"))?;
+        if let Some(c) = contest {
+            crate::attachments::save(&path, &crate::attachments::Metadata::default())?;
+            self.index
+                .contests
+                .iter_mut()
+                .find(|e| e.entry.id == c)
+                .context("contest missing")?
+                .challenges
+                .push(entry.clone());
+        } else {
+            self.index.contests.push(Contest {
+                entry: entry.clone(),
+                next_challenge: 1,
+                challenges: Vec::new(),
+            });
+            if self.index.current_contest.is_none() {
+                self.index.current_contest = Some(entry.id);
+            }
+        }
+        File::open(path.join(".ctf"))?.sync_all()?;
+        File::open(&path)?.sync_all()?;
+        self.save()
+            .context("adoption metadata commit failed; run `ctf doctor`")?;
+        self.finish()?;
+        Ok(entry)
     }
 
     fn cwd_ids(&self) -> Result<(Option<u64>, Option<u64>)> {
@@ -438,6 +655,31 @@ pub fn resolve<'a>(entries: &'a [Entry], query: &[String]) -> Result<&'a Entry> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_rename_commit_leaves_recoverable_journal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ws = Workspace::at(temp.path().into())?;
+        let contest = ws.create_contest("old")?;
+        let index = temp.path().join(".ctf/index.json");
+        let before = fs::read(&index)?;
+        fs::remove_file(&index)?;
+        fs::create_dir(&index)?; // Real persist failure after the directory rename.
+        assert!(ws.rename(None, contest.id, "new").is_err());
+        assert!(temp.path().join("new").is_dir());
+        assert!(temp.path().join(".ctf/pending.json").is_file());
+        fs::remove_dir(&index)?;
+        fs::write(index, before)?;
+        drop(ws);
+        assert!(Workspace::at(temp.path().into()).is_err());
+        assert!(crate::doctor::run(temp.path(), true).is_err());
+        fs::rename(temp.path().join("new"), temp.path().join("old"))?;
+        crate::doctor::run(temp.path(), true)?;
+        assert_eq!(
+            Workspace::at(temp.path().into())?.contest_entries()[0].id,
+            contest.id
+        );
+        Ok(())
+    }
     #[test]
     fn unicode_fuzzy_and_ambiguity() {
         let entries = vec![

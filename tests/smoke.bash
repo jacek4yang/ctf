@@ -69,4 +69,18 @@ ctf go '$(touch PWNED)'
 ctf use 研究生
 [[ "$PWD" == "$CTF_HOME/研究生网络安全创新大赛" ]]
 ctf info
+ctf use 1
+ctf go 2
+ctf rename 2 'easy RSA [中文]'
+[[ "$PWD" == "$CTF_HOME/BUUCTF/easy RSA [中文]" ]]
+ctf contest rename 1 'BUU renamed'
+[[ "$PWD" == "$CTF_HOME/BUU renamed/easy RSA [中文]" ]]
+ctf go 2
+[[ "$PWD" == "$CTF_HOME/BUU renamed/easy RSA [中文]" ]]
+ctf use 1
+mkdir 'adopt 中文'
+ctf adopt 'adopt 中文'
+ctf go 6
+[[ "$PWD" == "$CTF_HOME/BUU renamed/adopt 中文" ]]
+ctf doctor
 printf '%s\n' 'Linux/Bash smoke test passed.'
