@@ -2,7 +2,7 @@
 name = "ctf"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.93"
 description = "Fast Linux and Bash CTF workspace management"
 repository = "https://github.com/jacek4yang/ctf"
 license = "MIT"
@@ -14,7 +14,9 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz"] }
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "deflate"] }
 sha2 = "0.10"
 tar = "0.4"
 tempfile = "3"
@@ -24,5 +26,7 @@ x11rb = { version = "0.14", default-features = false }
 zip = { version = "4", default-features = false, features = ["deflate", "bzip2"] }
 
 [dev-dependencies]
+lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz", "encoder"] }
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress", "aes256"] }
 assert_cmd = "2"
 predicates = "3"

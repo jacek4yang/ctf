@@ -20,6 +20,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(name = "__unpack7z", hide = true)]
+    Unpack7z {
+        input: PathBuf,
+        stage: PathBuf,
+        parent: u32,
+    },
     /// Manage contests
     Contest {
         #[command(subcommand)]
@@ -104,6 +110,18 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Unpack7z {
+            input,
+            stage,
+            parent,
+        } => {
+            writeln!(
+                io::stdout().lock(),
+                "{}",
+                archive::unpack_7z(&input, &stage, parent)?
+            )?;
+            return Ok(());
+        }
         Command::Init { shell } => return shell::print_init(shell),
         Command::Completions { shell } => return shell::print_completions(shell),
         Command::Complete { words } => return shell::complete(&words),
@@ -242,7 +260,8 @@ fn run() -> Result<()> {
                 )?;
             }
         }
-        Command::Doctor { .. }
+        Command::Unpack7z { .. }
+        | Command::Doctor { .. }
         | Command::Init { .. }
         | Command::Completions { .. }
         | Command::Complete { .. } => {
