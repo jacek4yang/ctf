@@ -1,118 +1,151 @@
 # ctf
 
-Fast CTF workspace management for **Linux and Bash**. Contests and challenges
-are ordinary directories, with permanent numeric IDs and Unicode-friendly search.
+Fast CTF workspace management for **Linux + Bash**. Ordinary directories,
+permanent IDs, Unicode-friendly search, and preserved attachment originals.
+No solving tools, telemetry, database, or background service.
 
 ## Install
 
-Requires stable Rust (1.93+) and Bash.
+Download a [GitHub Release](https://github.com/jacek4yang/ctf/releases/latest).
+Binaries support x86-64 and ARM64 GNU/Linux with glibc 2.35+ (Ubuntu 22.04+).
+No Rust toolchain or clipboard/archive helper programs are required.
+
+```bash
+(
+  set -eu
+  version=1.0.0
+  arch=$(uname -m)             # x86_64 or aarch64
+  case "$arch" in x86_64|aarch64) ;; *) echo 'Unsupported architecture' >&2; exit 1;; esac
+  asset="ctf-v$version-$arch-unknown-linux-gnu.tar.gz"
+  base="https://github.com/jacek4yang/ctf/releases/download/v$version"
+  curl -fLO "$base/$asset"
+  curl -fLO "$base/SHA256SUMS"
+  sha256sum --check --ignore-missing SHA256SUMS
+  tar xf "$asset"
+  sudo install -m755 ctf /usr/local/bin/ctf
+)
+eval "$(ctf init bash)"
+```
+
+Run the download block in an empty directory. Add this line once to `~/.bashrc`:
+
+```bash
+eval "$(ctf init bash)"
+```
+
+Alternatively, with stable Rust 1.93+:
 
 ```bash
 cargo install --git https://github.com/jacek4yang/ctf --locked
-eval "$(ctf init bash)"
 ```
 
-Recommended `~/.bashrc` setup:
+Ensure the installed binary is on `PATH` (source installs use `~/.cargo/bin`).
+
+## Quick start
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-# Optional: export CTF_HOME=/absolute/path/to/workspace
-eval "$(ctf init bash)"
+ctf contest new BUUCTF
+ctf use BUUCTF
+ctf new easyRSA
+ctf import ~/Downloads/challenge.zip
+ctf extract
+ctf target 'nc example.com 1337'
+ctf info
 ```
 
-The default workspace is `~/CTF`. Bash integration provides dynamic completion
-and makes `ctf use`, `ctf new`, and `ctf go` change your current shell's directory.
-Without it, these commands print the destination instead.
+The default workspace is `~/CTF`. Override it with an absolute path, for example
+`export CTF_HOME=/data/CTF`. Bash integration lets `use`, `new`, and `go` change
+your current shell's directory, and provides dynamic name completion.
+Without integration, navigation prints the destination instead.
 
-## Use
+## Main commands
 
 ```bash
-ctf contest new "BUUCTF"
-ctf contest new "研究生网络安全创新大赛"
-ctf contest list
+ctf contest new '研究生网络安全创新大赛'
 ctf contest list 研究生
-ctf use 1                       # or: ctf use BUUCTF
-
-ctf new "签到题"
-ctf new "easyRSA"
-ctf new "[极客大挑战 2019]EasySQL"
-ctf new "RSA签到"
-ctf list
-ctf list rsa easy               # all terms must match
-ctf list 极客 sql
-ctf list --limit 50             # default: 20; also configurable with CTF_LIMIT
+ctf use 1                       # permanent contest ID or exact/unique query
+ctf new '签到题'
+ctf new '[极客大挑战 2019]EasySQL'
+ctf list rsa easy               # every term must match
+ctf list --limit 50             # default 20; also CTF_LIMIT
 ctf list --all
-ctf go 2                       # permanent ID, never a result row number
-ctf go 极客                     # exact name or unique fuzzy match
-ctf rename 2 "easy RSA"        # permanent ID stays 2
-ctf contest rename BUUCTF "BUU CTF"
+ctf go 2                       # permanent challenge ID, never a result row
+ctf go 极客
+ctf rename 2 'easy RSA'         # keeps ID and contents
+ctf contest rename BUUCTF 'BUU CTF'
 ctf adopt existing-directory   # direct child of the current contest
 ctf contest adopt existing-contest  # direct child of CTF_HOME
-
-ctf import ~/Downloads/challenge.zip
 ctf import 'https://example.org/attachment.zip'
-ctf paste
-ctf extract                    # or: ctf extract challenge.zip
-ctf target "nc 1.2.3.4 2333"
-ctf info
-ctf doctor                     # read-only integrity checks
-ctf doctor --fix               # remove only unambiguous internal residue
+ctf paste                      # native X11 clipboard text
+ctf extract challenge.tar.xz
+ctf doctor                     # read-only integrity check
+ctf doctor --fix               # conservative internal residue cleanup
 ```
 
-Search normalizes Unicode and case, ranking exact matches, prefixes, substrings,
-then ordered subsequences. Chinese and mixed names work without transliteration.
-Ambiguous queries show candidates with their permanent IDs and fail safely.
-Numeric input always selects an ID. `use` and `go` without arguments offer a
-compact terminal prompt. Quote shell metacharacters; use `--` before a name
-beginning with `-`. Names cannot contain slashes or control characters, or be
-empty, `.` / `..`, or `.ctf`.
+Exact names, prefixes, substrings, and ordered fuzzy matches work with Chinese,
+ASCII, mixed names, and case differences. Ambiguity always shows IDs instead of
+guessing. Numeric input always means a permanent ID. Quote shell metacharacters;
+use `--` before names beginning with `-`. Names cannot be empty, `.`, `..`, `.ctf`,
+or contain slashes/control characters. Adoption never moves a directory and
+refuses existing `.ctf` metadata. Renaming the current directory refreshes Bash's
+path with integration enabled.
 
-The current directory determines the contest. Outside a contest, the last
-`ctf use` selection applies. Imports, clipboard, extraction, and target commands
-must run inside a challenge. `--all` lists all matches in the current contest.
+The current directory determines the contest; outside one, the last `ctf use`
+selection applies. `list --all` means all matches in that contest. Attachment,
+clipboard, target, and extraction commands must run inside a challenge.
 
-## Source material
+## Workspace and originals
 
-Imports keep an independent read-only original under `.ctf/archive/` and an
-editable working copy in the challenge root. Collisions get `-2`, `-3`, etc.
-Metadata records source, filename, timestamp, size, and SHA-256. `ctf paste` has
-built-in native X11 clipboard reading: an X11 session with `$DISPLAY` is required,
-but no clipboard helper programs are needed. Wayland is not implemented yet.
-UTF-8 text is saved byte-for-byte, including empty text and line endings. Legacy
-`STRING` is accepted only for ASCII; other encodings fail without conversion.
-Clipboard transfers have a five-second deadline and the same 1 GiB attachment
-limit. Targets are stored as raw text. Neither command executes or decodes input.
+```text
+~/CTF/
+├── .ctf/                         # permanent IDs and current selection
+└── BUUCTF/
+    ├── .ctf/
+    └── easyRSA/
+        ├── .ctf/archive/         # independent read-only attachment originals
+        ├── attachment.zip       # editable working copy
+        └── extracted-…/         # successful extraction output
+```
 
-Extraction supports ZIP, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, TAR.XZ/TXZ, GZIP, BZIP2,
-XZ, and 7z (Copy, LZMA/LZMA2, BZIP2, Deflate). No archive helper is required. It creates
-a new `extracted-*` directory inside the challenge, rejecting traversal, absolute
-paths, links, special files, conflicting entries, and `.ctf` paths. It never
-recursively unpacks nested archives. Imports and expanded archives are limited
-to 1 GiB; archives to 10,000 entries. RAR and encrypted archives are not supported.
-XZ dictionaries are limited to 256 MiB. The isolated 7z decoder has a 1 GiB
-address-space limit and a 120-second deadline. HTTP downloads have a 120-second timeout.
+Imports never silently overwrite files: collisions get `-2`, `-3`, etc.
+Metadata records source, filename, timestamp, size, and SHA-256. `paste` preserves
+UTF-8 bytes exactly, including empty text and line endings. It requires X11 and
+`$DISPLAY`; no `xclip`, `xsel`, or `wl-clipboard` is needed. Legacy X11 `STRING`
+accepts ASCII only. Target strings are stored literally and never executed.
 
-Back up the entire workspace, including `.ctf` directories. IDs are never reused;
-manually deleting a challenge leaves its reserved record. Adoption is explicit,
-never moves files, and rejects directories already containing `.ctf`. Originals are protected against accidental
-editing, not deliberate changes by their owner. Interrupted operations can leave
-an unregistered directory or unreferenced original. Use a local filesystem with
-reliable file locks and atomic rename.
+Extraction uses isolated staging and publishes output only on success. Paths,
+links, special files, conflicts, and `.ctf` entries are checked. Supported formats:
+ZIP, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, TAR.XZ/TXZ, GZIP, BZIP2, XZ, and unencrypted
+7z with Copy/LZMA/LZMA2/BZIP2/Deflate. Nested archives are never unpacked automatically.
 
-`ctf doctor` checks metadata, permanent IDs, directories, attachment originals
-(size and SHA-256), missing working copies, and internal residue. Output uses
-`OK`, `WARN`, `ERROR`, and `FIXABLE` records; unresolved issues return exit 1.
-`--fix` reports `FIXED` and only removes unreferenced originals, internal temporary
-files and abandoned extraction staging, or clears an invalid current selection.
-It never adopts directories or reconstructs damaged IDs. Restore ambiguous
-metadata damage from a backup. Completed `extracted-*` directories are user data.
-Interrupted renames/adoptions leave `.ctf/pending.json` and block normal commands.
-Preserve the affected directories and inspect the record. For an uncommitted
-rename, move the new directory back to its recorded old name, then run
-`ctf doctor --fix`. Doctor clears only completed or unapplied journals; it never
-chooses between conflicting directories. Renaming your current directory refreshes
-Bash's path when integration is enabled.
-See [recovery guidance](docs/recovery.md) before manually changing damaged metadata.
+## Doctor, backups, and upgrades
+
+Doctor checks metadata, IDs, registered/unregistered directories, original hashes
+and sizes, missing copies, unsafe paths, and interrupted operations. Its records
+use `OK`, `WARN`, `ERROR`, `FIXABLE`, and `FIXED`; unresolved issues return exit 1.
+CLI usage errors return 2; other command failures return 1. Diagnostics go to
+stderr; normal results go to stdout.
+
+`--fix` removes only unambiguous internal residue, clears invalid current selection,
+and finishes cleanup of committed operations. It never reassigns IDs, auto-adopts
+directories, or reconstructs corrupt metadata. See [recovery guidance](docs/recovery.md)
+before manual repairs. Completed extraction directories are user data, not residue.
+
+Back up the **entire workspace**, including all `.ctf` directories. Before upgrading,
+stop active operations, back up, run doctor, and replace the binary using the same
+verified installation steps. Existing v0.1 workspaces remain readable without
+automatic migration. IDs are never reused, even after failures or manual deletion.
+
+## Deliberate limits
+
+Linux + Bash + X11 only. Use a local filesystem with reliable locks and atomic
+rename. Originals resist accidental edits, not deliberate changes by their owner.
+Ambiguous damage requires manual recovery or backup restoration.
+
+Attachment/archive input and expanded output: 1 GiB; extracted entries: 10,000.
+Clipboard: five seconds; HTTP and 7z: 120 seconds. XZ dictionaries: 256 MiB;
+7z decoder address space: 1 GiB. RAR, encrypted archives, other 7z codecs, and
+encoding conversion are unsupported.
 
 ## Development
 
@@ -122,8 +155,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 cargo build --release
 bash tests/smoke.bash
-# Optional locally; CI runs these with Xvfb and xauth installed:
+# With Xvfb and xauth installed (CI runs this):
 xvfb-run -a cargo test --test cli -- --ignored --test-threads=1
 ```
+
+Official releases are built by GitHub Actions from version-matching `vX.Y.Z` tags
+on merged `main`, using locked dependencies and a pinned stable compiler. Release
+PRs dry-run both architectures and clean-container installation before publication.
 
 MIT licensed.

@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'README.md'
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_RUST: '1.98.0'
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Validate release identity
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="v$(bash scripts/release.bash version)"
+          if [[ "$REF_TYPE" == tag ]]; then
+            tag="$REF_NAME"
+            git fetch origin main
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+          bash scripts/release.bash validate "$tag"
+          if bash scripts/release.bash validate v99999.0.0; then exit 1; fi
+          if bash scripts/release.bash validate 'v1.0.0;false'; then exit 1; fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned stable Rust
+        run: rustup toolchain install "$RELEASE_RUST" --profile minimal --component rustfmt --component clippy && rustup default "$RELEASE_RUST"
+      - name: Quality gates
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb xauth
+          xvfb-run -a cargo test --locked --test cli -- --ignored --test-threads=1
+          cargo build --locked --release
+          bash tests/smoke.bash
+      - name: Package and test installation
+        run: |
+          bash scripts/release.bash package "$RELEASE_TAG" "$TARGET" dist
+          bash scripts/install-smoke.bash "dist/ctf-$RELEASE_TAG-$TARGET.tar.gz"
+          # This container contains no Rust toolchain or application helper dependencies.
+          docker run --rm --network none -v "$PWD/dist:/release:ro" -v "$PWD/tests:/tests:ro" ubuntu:22.04 \
+            bash -euc 'cd /tmp; tar xf "/release/$1"; install -m755 ctf /usr/local/bin/ctf; ! command -v cargo; ! command -v node; ! command -v python3; bash /tests/smoke.bash /usr/local/bin' \
+            bash "ctf-$RELEASE_TAG-$TARGET.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Publish once, only after every validation passes
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            printf '%s\n' 'Release already exists; refusing to overwrite it' >&2
+            exit 1
+          fi
+          (cd dist && sha256sum "ctf-$RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz" "ctf-$RELEASE_TAG-aarch64-unknown-linux-gnu.tar.gz" > SHA256SUMS)
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag --draft --title "$RELEASE_TAG" --notes-file CHANGELOG.md
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+
+  verify-published:
+    needs: [validate, publish]
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download official artifacts and verify clean-machine installation
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" --pattern "ctf-$RELEASE_TAG-$TARGET.tar.gz" --pattern SHA256SUMS --dir dist
+          (cd dist && sha256sum --check --ignore-missing SHA256SUMS)
+          bash scripts/install-smoke.bash "dist/ctf-$RELEASE_TAG-$TARGET.tar.gz"
+          docker run --rm --network none -v "$PWD/dist:/release:ro" -v "$PWD/tests:/tests:ro" ubuntu:22.04 \
+            bash -euc 'cd /tmp; tar xf "/release/$1"; install -m755 ctf /usr/local/bin/ctf; ! command -v cargo; ! command -v node; ! command -v python3; bash /tests/smoke.bash /usr/local/bin' \
+            bash "ctf-$RELEASE_TAG-$TARGET.tar.gz"
