@@ -1,0 +1,26 @@
+[package]
+name = "ctf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Fast Linux and Bash CTF workspace management"
+repository = "https://github.com/jacek4yang/ctf"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bzip2 = "0.6"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3"
+unicode-normalization = "0.1"
+ureq = "3"
+zip = { version = "4", default-features = false, features = ["deflate", "bzip2"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
