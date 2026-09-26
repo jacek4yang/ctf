@@ -69,9 +69,13 @@ must run inside a challenge. `--all` lists all matches in the current contest.
 
 Imports keep an independent read-only original under `.ctf/archive/` and an
 editable working copy in the challenge root. Collisions get `-2`, `-3`, etc.
-Metadata records source, filename, timestamp, size, and SHA-256. Clipboard text
-is saved verbatim as UTF-8; install `wl-clipboard` (Wayland), `xclip`, or `xsel`
-(X11). Targets are stored as raw text. Neither command executes or decodes input.
+Metadata records source, filename, timestamp, size, and SHA-256. `ctf paste` has
+built-in native X11 clipboard reading: an X11 session with `$DISPLAY` is required,
+but no clipboard helper programs are needed. Wayland is not implemented yet.
+UTF-8 text is saved byte-for-byte, including empty text and line endings. Legacy
+`STRING` is accepted only for ASCII; other encodings fail without conversion.
+Clipboard transfers have a five-second deadline and the same 1 GiB attachment
+limit. Targets are stored as raw text. Neither command executes or decodes input.
 
 Extraction supports ZIP, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, GZIP, and BZIP2. It creates
 a new `extracted-*` directory inside the challenge, rejecting traversal, absolute
@@ -95,6 +99,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 cargo build --release
 bash tests/smoke.bash
+# Optional locally; CI runs these with Xvfb and xauth installed:
+xvfb-run -a cargo test --test cli -- --ignored --test-threads=1
 ```
 
 MIT licensed.

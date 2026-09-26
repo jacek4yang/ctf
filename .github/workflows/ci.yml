@@ -25,6 +25,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
+      - name: Native X11 clipboard tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y xvfb xauth
+          xvfb-run -a cargo test --test cli -- --ignored --test-threads=1
       - run: cargo build --release
       - name: Bash smoke test
         run: bash tests/smoke.bash

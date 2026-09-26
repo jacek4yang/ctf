@@ -19,6 +19,7 @@ tar = "0.4"
 tempfile = "3"
 unicode-normalization = "0.1"
 ureq = "3"
+x11rb = { version = "0.14", default-features = false }
 zip = { version = "4", default-features = false, features = ["deflate", "bzip2"] }
 
 [dev-dependencies]

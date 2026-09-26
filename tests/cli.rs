@@ -3,9 +3,12 @@ use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use tempfile::TempDir;
+
+#[path = "support/x11.rs"]
+mod x11;
 
 fn ctf(home: &Path) -> Command {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("ctf"));
@@ -350,26 +353,16 @@ fn linux_names_and_contest_ambiguity() {
 }
 
 #[test]
-fn paste_preserves_plain_text_with_mock_clipboard() {
-    let (temp, home) = setup();
+#[ignore = "requires an isolated X11 server; run under xvfb-run with --ignored --test-threads=1"]
+fn paste_preserves_plain_text_with_native_clipboard() {
+    let (_temp, home) = setup();
     ctf(&home).args(["new", "clipboard"]).assert().success();
     let challenge = home.join("研究生网络安全创新大赛/clipboard");
-    let bin = temp.path().join("bin");
-    fs::create_dir(&bin).unwrap();
-    let helper = bin.join("wl-paste");
-    fs::write(
-        &helper,
-        "#!/bin/sh\nexec /bin/cat -- \"$CTF_TEST_CLIPBOARD\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
-    let input = temp.path().join("clipboard-source");
     let text = "中文\r\n  aGVsbG8=\n\\x41\n";
-    fs::write(&input, text).unwrap();
+    let _owner = x11::Owner::new(text.as_bytes(), x11::Mode::Utf8).unwrap();
     ctf(&home)
         .current_dir(&challenge)
-        .env("PATH", &bin)
-        .env("CTF_TEST_CLIPBOARD", &input)
+        .env("PATH", "") // Native reading must not require any helper executable.
         .arg("paste")
         .assert()
         .success()
@@ -411,6 +404,156 @@ fn metadata_symlinks_are_rejected() {
         .assert()
         .failure();
     assert_eq!(fs::read_to_string(source).unwrap(), "original");
+}
+
+#[test]
+fn paste_requires_an_available_x11_display() {
+    let (_temp, home) = setup();
+    ctf(&home).args(["new", "clipboard"]).assert().success();
+    let challenge = home.join("研究生网络安全创新大赛/clipboard");
+    for display in [None, Some(""), Some("unix:65535")] {
+        let mut command = ctf(&home);
+        command.current_dir(&challenge).env_remove("DISPLAY");
+        if let Some(display) = display {
+            command.env("DISPLAY", display);
+        }
+        command
+            .arg("paste")
+            .timeout(std::time::Duration::from_secs(8))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("X11"));
+        assert!(!challenge.join("clipboard.txt").exists());
+    }
+}
+
+#[test]
+fn paste_times_out_even_if_the_x_server_stalls_during_connect() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let (_temp, home) = setup();
+    ctf(&home).args(["new", "clipboard"]).assert().success();
+    let challenge = home.join("研究生网络安全创新大赛/clipboard");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let display = format!("127.0.0.1:{}", listener.local_addr().unwrap().port() - 6000);
+    listener.set_nonblocking(true).unwrap();
+    let (release, wait) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((_socket, _)) => {
+                    // Accept the connection but never answer its X11 setup request.
+                    let _ = wait.recv_timeout(Duration::from_secs(8));
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("test X11 server: {error}"),
+            }
+        }
+        panic!("ctf did not connect to the test X11 server");
+    });
+    ctf(&home)
+        .current_dir(&challenge)
+        .env("DISPLAY", display)
+        .arg("paste")
+        .timeout(Duration::from_secs(7))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("timed out"));
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert!(!challenge.join("clipboard.txt").exists());
+}
+
+#[test]
+#[ignore = "claims CLIPBOARD; run on an explicit X11 display, serially"]
+fn native_x11_verbatim_transfers() {
+    use x11::Mode;
+    let large = "中文\nhello\r\n\0  ".repeat(120_000);
+    for (mode, bytes) in [
+        (Mode::Utf8, b"".as_slice()),
+        (Mode::Utf8, "hello 中文\nsecond line".as_bytes()),
+        (Mode::Utf8, &large.as_bytes()[..200_000]),
+        (Mode::Incr, large.as_bytes()),
+        (Mode::Incr, b""),
+        (Mode::LoseSelectionIncr, "中文\n".as_bytes()),
+        (Mode::IncrTargets, "中文\n".as_bytes()),
+        (Mode::NoTargets, "中文\r\n  ".as_bytes()),
+        (Mode::String, b"ASCII\r\n\0 "),
+        (Mode::Text, "中文".as_bytes()),
+        (Mode::RefuseUtf8, b"fallback\n"),
+        (Mode::StaleEvents, "中文".as_bytes()),
+    ] {
+        eprintln!("X11 {mode:?}: {} bytes", bytes.len());
+        let (_temp, home) = setup();
+        ctf(&home).args(["new", "clipboard"]).assert().success();
+        let challenge = home.join("研究生网络安全创新大赛/clipboard");
+        let _owner = x11::Owner::new(bytes, mode).unwrap();
+        ctf(&home)
+            .current_dir(&challenge)
+            .env("PATH", "")
+            .arg("paste")
+            .timeout(std::time::Duration::from_secs(8))
+            .assert()
+            .success();
+        assert_eq!(fs::read(challenge.join("clipboard.txt")).unwrap(), bytes);
+        let meta: Value =
+            serde_json::from_slice(&fs::read(challenge.join(".ctf/challenge.json")).unwrap())
+                .unwrap();
+        let original = meta["attachments"][0]["original"].as_str().unwrap();
+        assert_eq!(fs::read(challenge.join(original)).unwrap(), bytes);
+    }
+}
+
+#[test]
+#[ignore = "requires an isolated X11 server; run under xvfb-run serially"]
+fn native_x11_failures_are_bounded_and_do_not_import() {
+    use x11::Mode;
+    for (mode, bytes, error) in [
+        (Mode::Utf8, b"\xff".as_slice(), "invalid UTF-8"),
+        (Mode::String, b"caf\xe9", "non-ASCII"),
+        (Mode::Unsupported, b"", "no usable textual target"),
+        (Mode::WrongFormat, b"", "type or format"),
+        (Mode::BadIncrHeader, b"", "type or format"),
+        (Mode::Oversized, b"", "permitted size"),
+        (Mode::ChangeType, b"first chunk", "type or format"),
+        (Mode::Truncated, b"truncated", "minimum size"),
+        (Mode::Disappear, b"", "owner disappeared"),
+        (Mode::DisappearIncr, b"first chunk", "owner disappeared"),
+        (Mode::Stall, b"", "timed out"),
+        (Mode::StallIncr, b"", "timed out"),
+    ] {
+        eprintln!("X11 error case: {mode:?}");
+        let (_temp, home) = setup();
+        ctf(&home).args(["new", "clipboard"]).assert().success();
+        let challenge = home.join("研究生网络安全创新大赛/clipboard");
+        let before = fs::read(challenge.join(".ctf/challenge.json")).unwrap();
+        let _owner = x11::Owner::new(bytes, mode).unwrap();
+        ctf(&home)
+            .current_dir(&challenge)
+            .arg("paste")
+            .timeout(std::time::Duration::from_secs(8))
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(error));
+        assert!(!challenge.join("clipboard.txt").exists());
+        assert_eq!(
+            fs::read(challenge.join(".ctf/challenge.json")).unwrap(),
+            before
+        );
+    }
+    // The fixture disconnects on drop, leaving the isolated server ownerless.
+    let (_temp, home) = setup();
+    ctf(&home).args(["new", "clipboard"]).assert().success();
+    ctf(&home)
+        .current_dir(home.join("研究生网络安全创新大赛/clipboard"))
+        .arg("paste")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no owner"));
 }
 
 #[test]
