@@ -131,9 +131,15 @@ impl Unpacker<'_> {
 pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
     let file = File::open(input).with_context(|| format!("open archive {}", input.display()))?;
     ensure!(file.metadata()?.is_file(), "archive must be a regular file");
+    // Only unfinished extraction lives in reserved metadata storage. Completed
+    // extracted-* directories remain user data and are never doctor cleanup targets.
+    crate::workspace::directory(&challenge.join(".ctf"))?;
+    let _lock = crate::attachments::lock(challenge)?;
+    let staging = challenge.join(".ctf/staging");
+    crate::workspace::directory(&staging)?;
     let stage = tempfile::Builder::new()
         .prefix("extracted-")
-        .tempdir_in(challenge)?;
+        .tempdir_in(&staging)?;
     let mut unpacker = Unpacker {
         root: stage.path(),
         bytes: 0,
@@ -185,7 +191,22 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
         bail!("unsupported archive format; supported: zip, tar, tar.gz/tgz, tar.bz2/tbz2, gz, bz2");
     }
     let count = unpacker.files;
-    Ok((count, stage.keep()))
+    let output = challenge.join(
+        stage
+            .path()
+            .file_name()
+            .context("staging directory has no name")?,
+    );
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        stage.path(),
+        rustix::fs::CWD,
+        &output,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )?;
+    File::open(challenge)?.sync_all()?;
+    File::open(staging)?.sync_all()?;
+    Ok((count, output))
 }
 
 #[cfg(test)]
@@ -223,7 +244,8 @@ mod tests {
         zip.write_all(b"bad")?;
         zip.finish()?;
         assert!(extract(&zip_path, temp.path()).is_err());
-        assert_eq!(fs::read_dir(temp.path())?.count(), 1);
+        assert_eq!(fs::read_dir(temp.path())?.count(), 2); // input and reserved .ctf
+        assert_eq!(fs::read_dir(temp.path().join(".ctf/staging"))?.count(), 0);
         Ok(())
     }
     #[test]
@@ -271,7 +293,7 @@ mod tests {
         bytes[crc] ^= 0xff;
         fs::write(&input, bytes)?;
         assert!(extract(&input, temp.path()).is_err());
-        assert_eq!(fs::read_dir(temp.path())?.count(), 2);
+        assert_eq!(fs::read_dir(temp.path())?.count(), 3);
         Ok(())
     }
 

@@ -67,6 +67,7 @@ pub fn complete(words: &[String]) -> Result<()> {
             "extract",
             "target",
             "info",
+            "doctor",
             "init",
             "completions",
             "--help",
@@ -74,6 +75,8 @@ pub fn complete(words: &[String]) -> Result<()> {
         ])
     } else if words[0] == "contest" && words.len() == 2 {
         Some(&["new", "list"])
+    } else if words[0] == "doctor" {
+        Some(&["--fix", "--help"])
     } else if matches!(words[0].as_str(), "init" | "completions") {
         Some(&["bash"])
     } else if current.starts_with('-')

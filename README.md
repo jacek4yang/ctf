@@ -51,6 +51,8 @@ ctf paste
 ctf extract                    # or: ctf extract challenge.zip
 ctf target "nc 1.2.3.4 2333"
 ctf info
+ctf doctor                     # read-only integrity checks
+ctf doctor --fix               # remove only unambiguous internal residue
 ```
 
 Search normalizes Unicode and case, ranking exact matches, prefixes, substrings,
@@ -90,6 +92,14 @@ existing directories is not supported. Originals are protected against accidenta
 editing, not deliberate changes by their owner. Interrupted operations can leave
 an unregistered directory or unreferenced original. Use a local filesystem with
 reliable file locks and atomic rename.
+
+`ctf doctor` checks metadata, permanent IDs, directories, attachment originals
+(size and SHA-256), missing working copies, and internal residue. Output uses
+`OK`, `WARN`, `ERROR`, and `FIXABLE` records; unresolved issues return exit 1.
+`--fix` reports `FIXED` and only removes unreferenced originals, internal temporary
+files and abandoned extraction staging, or clears an invalid current selection.
+It never adopts directories or reconstructs damaged IDs. Restore ambiguous
+metadata damage from a backup. Completed `extracted-*` directories are user data.
 
 ## Development
 

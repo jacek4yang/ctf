@@ -1,6 +1,7 @@
 mod archive;
 mod attachments;
 mod clipboard;
+mod doctor;
 mod shell;
 mod workspace;
 
@@ -49,6 +50,11 @@ enum Command {
     Target { text: String },
     /// Show the current contest/challenge and attachment metadata
     Info,
+    /// Inspect workspace integrity; --fix removes only unambiguous internal residue
+    Doctor {
+        #[arg(long)]
+        fix: bool,
+    },
     /// Print shell integration, including dynamic completion
     Init { shell: shell::Shell },
     /// Print dynamic shell completion setup (included by init)
@@ -93,6 +99,7 @@ fn run() -> Result<()> {
         Command::Init { shell } => return shell::print_init(shell),
         Command::Completions { shell } => return shell::print_completions(shell),
         Command::Complete { words } => return shell::complete(&words),
+        Command::Doctor { fix } => return doctor::run(&workspace::home()?, fix),
         _ => {}
     }
     let mut ws = Workspace::open()?;
@@ -202,7 +209,10 @@ fn run() -> Result<()> {
                 )?;
             }
         }
-        Command::Init { .. } | Command::Completions { .. } | Command::Complete { .. } => {
+        Command::Doctor { .. }
+        | Command::Init { .. }
+        | Command::Completions { .. }
+        | Command::Complete { .. } => {
             unreachable!()
         }
     }

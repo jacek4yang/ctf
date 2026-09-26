@@ -256,6 +256,7 @@ dependencies = [
  "clap",
  "flate2",
  "predicates",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
