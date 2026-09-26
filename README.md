@@ -112,6 +112,7 @@ rename, move the new directory back to its recorded old name, then run
 `ctf doctor --fix`. Doctor clears only completed or unapplied journals; it never
 chooses between conflicting directories. Renaming your current directory refreshes
 Bash's path when integration is enabled.
+See [recovery guidance](docs/recovery.md) before manually changing damaged metadata.
 
 ## Development
 

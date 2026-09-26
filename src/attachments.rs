@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,12 +19,22 @@ pub fn lock(challenge: &Path) -> Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
         .open(path)?;
+    ensure!(
+        file.metadata()?.is_file() && file.metadata()?.nlink() == 1,
+        "unsafe challenge lock"
+    );
     file.lock().context("lock challenge")?;
+    ensure!(
+        fs::symlink_metadata(challenge.join(".ctf/import.json"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "interrupted attachment import; run `ctf doctor`"
+    );
     Ok(file)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attachment {
     pub filename: String,
@@ -57,7 +68,8 @@ pub fn load(challenge: &Path) -> Result<Metadata> {
     let path = challenge.join(".ctf/challenge.json");
     reject_link(&path)?;
     let meta: Metadata = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        &crate::workspace::read_regular(&path)
+            .with_context(|| format!("read {}", path.display()))?,
     )
     .context("invalid challenge metadata")?;
     ensure!(meta.version == 1, "unsupported challenge metadata version");
@@ -102,8 +114,11 @@ pub fn import(challenge: &Path, source: &str) -> Result<Attachment> {
         } else {
             source.into()
         };
-        let file =
-            File::open(&path).with_context(|| format!("open attachment {}", path.display()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(&path)
+            .with_context(|| format!("open attachment {}", path.display()))?;
         ensure!(
             file.metadata()?.is_file(),
             "attachment source must be a regular file"
@@ -178,7 +193,7 @@ pub fn store(challenge: &Path, source: &str, name: &str, reader: impl Read) -> R
     }
     let sha256 = format!("{:x}", hash.finalize());
     original.rewind()?;
-    let mut working = tempfile::NamedTempFile::new_in(challenge)?;
+    let mut working = tempfile::NamedTempFile::new_in(challenge.join(".ctf"))?;
     std::io::copy(&mut original, &mut working)?;
     working.as_file().sync_all()?;
     let stem = Path::new(name)
@@ -203,10 +218,9 @@ pub fn store(challenge: &Path, source: &str, name: &str, reader: impl Read) -> R
                 .context("filename space exhausted")?;
             continue;
         }
-        match working.persist_noclobber(challenge.join(&candidate)) {
-            Ok(_) => break candidate,
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                working = error.file;
+        match fs::symlink_metadata(challenge.join(&candidate)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break candidate,
+            Ok(_) => {
                 sequence = sequence
                     .checked_add(1)
                     .context("filename space exhausted")?;
@@ -236,15 +250,21 @@ pub fn store(challenge: &Path, source: &str, name: &str, reader: impl Read) -> R
     file.set_permissions(permissions)?;
     file.sync_all()?;
     File::open(&original_dir)?.sync_all()?;
+    // Persist intent before publishing a working copy. An uncertain metadata
+    // commit never triggers destructive rollback: doctor can inspect both copies.
+    let journal = challenge.join(".ctf/import.json");
+    atomic_json(&journal, &attachment)?;
+    working.persist_noclobber(challenge.join(&filename)).context("publish attachment without overwriting; original and import journal retained for doctor")?;
     File::open(challenge)?.sync_all()?;
     meta.attachments.push(attachment);
     if let Err(error) = save(challenge, &meta) {
-        let _ = fs::remove_file(challenge.join(&filename));
         bail!(
-            "{error:#}; original preserved at {}",
+            "{error:#}; both copies and import journal preserved; run `ctf doctor`; original at {}",
             original_path.display()
         );
     }
+    fs::remove_file(journal)?;
+    File::open(challenge.join(".ctf"))?.sync_all()?;
     meta.attachments
         .pop()
         .context("attachment metadata missing")
@@ -257,6 +277,38 @@ pub fn clipboard() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_metadata_commit_preserves_both_copies_and_intent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        directory(&temp.path().join(".ctf"))?;
+        save(temp.path(), &Metadata::default())?;
+        struct BreakCommit {
+            path: std::path::PathBuf,
+            bytes: std::io::Cursor<Vec<u8>>,
+            changed: bool,
+        }
+        impl Read for BreakCommit {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if !self.changed {
+                    fs::remove_file(&self.path)?;
+                    fs::create_dir(&self.path)?;
+                    self.changed = true;
+                }
+                self.bytes.read(buffer)
+            }
+        }
+        let reader = BreakCommit {
+            path: temp.path().join(".ctf/challenge.json"),
+            bytes: std::io::Cursor::new(b"preserved".to_vec()),
+            changed: false,
+        };
+        assert!(store(temp.path(), "test", "source.txt", reader).is_err());
+        assert_eq!(fs::read(temp.path().join("source.txt"))?, b"preserved");
+        let pending: Attachment =
+            serde_json::from_slice(&fs::read(temp.path().join(".ctf/import.json"))?)?;
+        assert_eq!(fs::read(temp.path().join(pending.original))?, b"preserved");
+        Ok(())
+    }
     #[test]
     fn collisions_and_originals() -> Result<()> {
         let temp = tempfile::tempdir()?;

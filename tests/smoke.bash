@@ -55,6 +55,8 @@ ctf extract
 mapfile -t extracted < <(find . -maxdepth 1 -type d -name 'extracted-*')
 [[ ${#extracted[@]} -eq 1 ]]
 cmp "${extracted[0]}/附件.txt" "$smoke_root/fixtures/附件.txt"
+ctf target 'nc example.com 1337'
+[[ $(ctf info) == *'nc example.com 1337'* ]]
 
 COMP_WORDS=(ctf go '[极')
 COMP_CWORD=2
@@ -82,5 +84,22 @@ mkdir 'adopt 中文'
 ctf adopt 'adopt 中文'
 ctf go 6
 [[ "$PWD" == "$CTF_HOME/BUU renamed/adopt 中文" ]]
+ctf doctor
+mkdir -p .ctf/staging/interrupted
+printf 'partial\n' > .ctf/staging/interrupted/partial
+if ctf doctor > "$smoke_root/doctor.txt"; then exit 1; fi
+ctf doctor --fix
+[[ ! -e .ctf/staging/interrupted ]]
+ctf doctor
+for name in "single'quote" 'double"quote' '$dollar' 'back\slash' '-leading'; do
+    ctf new -- "$name"
+    [[ "$PWD" == "$CTF_HOME/BUU renamed/$name" ]]
+    ctf go -- "$name"
+    [[ "$PWD" == "$CTF_HOME/BUU renamed/$name" ]]
+done
+COMP_WORDS=(ctf rename 'back')
+COMP_CWORD=2
+_ctf_complete
+[[ ${COMPREPLY[0]} == 'back\slash' ]]
 ctf doctor
 printf '%s\n' 'Linux/Bash smoke test passed.'
