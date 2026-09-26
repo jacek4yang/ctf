@@ -15,19 +15,19 @@ pub struct Entry {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Contest {
-    entry: Entry,
-    next_challenge: u64,
-    challenges: Vec<Entry>,
+pub(crate) struct Contest {
+    pub entry: Entry,
+    pub next_challenge: u64,
+    pub challenges: Vec<Entry>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Index {
-    version: u32,
-    next_contest: u64,
-    current_contest: Option<u64>,
-    contests: Vec<Contest>,
+pub(crate) struct Index {
+    pub version: u32,
+    pub next_contest: u64,
+    pub current_contest: Option<u64>,
+    pub contests: Vec<Contest>,
 }
 
 pub struct Workspace {
