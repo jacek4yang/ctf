@@ -162,3 +162,61 @@ fn fifo_sources_are_rejected_without_waiting_for_a_writer() {
             .stderr(predicate::str::contains("regular file"));
     }
 }
+
+#[test]
+fn version_one_workspace_remains_compatible_without_migration() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let challenge = root.join("中文/old challenge");
+    fs::create_dir_all(root.join(".ctf")).unwrap();
+    fs::create_dir_all(root.join("中文/.ctf")).unwrap();
+    fs::create_dir_all(challenge.join(".ctf")).unwrap();
+    fs::write(root.join(".ctf/lock"), b"").unwrap();
+    let legacy = br#"{"version":1,"target":"nc example.com 1337","attachments":[]}"#;
+    fs::write(challenge.join(".ctf/challenge.json"), legacy).unwrap();
+    let index = json!({"version":1,"next_contest":9,"current_contest":7,
+        "contests":[{"entry":{"id":7,"name":"中文"},"next_challenge":12,
+        "challenges":[{"id":3,"name":"old challenge"}]}]});
+    fs::write(
+        root.join(".ctf/index.json"),
+        serde_json::to_vec(&index).unwrap(),
+    )
+    .unwrap();
+    ctf(root).arg("doctor").assert().success();
+    ctf(root).args(["go", "3"]).assert().success();
+    ctf(root)
+        .args(["rename", "3", "renamed"])
+        .assert()
+        .success();
+    ctf(root).args(["new", "new challenge"]).assert().success();
+    let after: Value =
+        serde_json::from_slice(&fs::read(root.join(".ctf/index.json")).unwrap()).unwrap();
+    assert_eq!(after["contests"][0]["challenges"][0]["id"], 3);
+    assert_eq!(after["contests"][0]["challenges"][1]["id"], 12);
+    assert_eq!(after["contests"][0]["entry"]["id"], 7);
+    assert_eq!(after["next_contest"], 9);
+    assert_eq!(
+        fs::read(root.join("中文/renamed/.ctf/challenge.json")).unwrap(),
+        legacy
+    );
+    ctf(root).arg("doctor").assert().success();
+}
+
+#[test]
+fn oversized_recorded_attachment_is_rejected_without_repair() {
+    let temp = setup();
+    let root = temp.path();
+    let path = root.join("contest/challenge/.ctf/challenge.json");
+    let invalid = json!({"version":1,"target":null,"attachments":[{
+        "filename":"file", "original":".ctf/archive/original", "source":"test",
+        "timestamp_unix":0,"sha256":"0".repeat(64),"bytes":1073741825_u64
+    }]});
+    let bytes = serde_json::to_vec(&invalid).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    ctf(root)
+        .args(["doctor", "--fix"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("recorded attachment exceeds"));
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
