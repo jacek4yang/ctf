@@ -128,7 +128,7 @@ stderr; normal results go to stdout.
 
 `--fix` removes only unambiguous internal residue, clears invalid current selection,
 and finishes cleanup of committed operations. It never reassigns IDs, auto-adopts
-directories, or reconstructs corrupt metadata. See [recovery guidance](docs/recovery.md)
+directories, or reconstructs corrupt metadata. See [recovery guidance](https://github.com/jacek4yang/ctf/blob/main/docs/recovery.md)
 before manual repairs. Completed extraction directories are user data, not residue.
 
 Back up the **entire workspace**, including all `.ctf` directories. Before upgrading,

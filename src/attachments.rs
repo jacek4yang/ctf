@@ -76,6 +76,10 @@ pub fn load(challenge: &Path) -> Result<Metadata> {
     let mut filenames = std::collections::HashSet::new();
     let mut originals = std::collections::HashSet::new();
     for attachment in &meta.attachments {
+        ensure!(
+            attachment.bytes <= MAX_ATTACHMENT,
+            "recorded attachment exceeds 1 GiB limit"
+        );
         validate_name(&attachment.filename)?;
         ensure!(
             filenames.insert(&attachment.filename) && originals.insert(&attachment.original),

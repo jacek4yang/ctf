@@ -1,5 +1,6 @@
 use crate::workspace::validate_name;
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -62,6 +63,7 @@ struct Unpacker<'a> {
     bytes: u64,
     entries: usize,
     files: usize,
+    paths: HashSet<PathBuf>,
 }
 
 impl Unpacker<'_> {
@@ -76,6 +78,14 @@ impl Unpacker<'_> {
             return Ok(());
         }
         let relative = safe_path(name)?;
+        // Count implicit parents before creating them, not only archive members.
+        for prefix in relative.ancestors().filter(|p| !p.as_os_str().is_empty()) {
+            self.paths.insert(prefix.to_path_buf());
+            ensure!(
+                self.paths.len() <= MAX_ENTRIES,
+                "archive exceeds {MAX_ENTRIES} filesystem entries including implicit directories"
+            );
+        }
         let output = self.root.join(relative);
         if directory {
             fs::create_dir_all(output)?;
@@ -152,6 +162,7 @@ pub fn extract(input: &Path, challenge: &Path) -> Result<(usize, PathBuf)> {
         bytes: 0,
         entries: 0,
         files: 0,
+        paths: HashSet::new(),
     };
     let name = input
         .file_name()
@@ -382,6 +393,7 @@ pub fn unpack_7z(input: &Path, stage: &Path, parent: u32) -> Result<usize> {
         bytes: 0,
         entries: 0,
         files: 0,
+        paths: HashSet::new(),
     };
     archive.for_each_entries(|entry, reader| {
         unpacker
@@ -404,6 +416,7 @@ mod tests {
             bytes: MAX_BYTES - 1,
             entries: 0,
             files: 0,
+            paths: HashSet::new(),
         };
         assert!(unpacker.entry("too-large", false, &b"xx"[..]).is_err());
         let mut unpacker = Unpacker {
@@ -411,9 +424,20 @@ mod tests {
             bytes: 0,
             entries: MAX_ENTRIES,
             files: 0,
+            paths: HashSet::new(),
         };
         assert!(unpacker.entry("too-many", false, std::io::empty()).is_err());
         assert!(!temp.path().join("too-many").exists());
+        unpacker.entries = 0;
+        unpacker.paths = (0..MAX_ENTRIES)
+            .map(|n| PathBuf::from(format!("reserved-{n}")))
+            .collect();
+        assert!(
+            unpacker
+                .entry("new-parent/file", false, std::io::empty())
+                .is_err()
+        );
+        assert!(!temp.path().join("new-parent").exists());
         Ok(())
     }
     #[test]
@@ -519,6 +543,7 @@ mod tests {
             bytes: 0,
             entries: 0,
             files: 0,
+            paths: HashSet::new(),
         };
         unpacker.entry("duplicate", false, &b"first"[..])?;
         assert!(unpacker.entry("duplicate", false, &b"second"[..]).is_err());
